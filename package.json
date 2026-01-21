@@ -1,0 +1,18 @@
+{
+  "name": "stacks-p2p-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "SNaP2P - Stacks-Native P2P Session & Stream Framework",
+  "type": "module",
+  "scripts": {
+    "build": "pnpm -r build",
+    "test": "pnpm -r test",
+    "clean": "pnpm -r clean",
+    "demo:listen": "node packages/snap2p-demo/dist/index.js listen",
+    "demo:dial": "node packages/snap2p-demo/dist/index.js dial",
+    "demo:chat": "node packages/snap2p-demo/dist/index.js chat"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
