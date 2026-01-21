@@ -8,7 +8,7 @@ A minimal peer-to-peer framework providing secure, authenticated sessions betwee
 
 SNaP2P gives you direct, encrypted connections between peers where:
 
-- **Identity is a Stacks address** - Your wallet *is* your identity
+- **Identity is a Stacks address** - Your STX wallet is your identity/user identifier
 - **Everything is encrypted** - Noise XX handshake with ChaCha20-Poly1305 transport
 - **Streams are just bytes** - Send chat messages, files, game state, whatever you want
 - **No middlemen** - Direct peer-to-peer TCP connections, no relays or servers
