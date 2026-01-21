@@ -28,3 +28,6 @@ export * from './stream/index.js';
 
 // Peer API (main entry point)
 export * from './peer/index.js';
+
+// Utilities
+export * from './utils/index.js';

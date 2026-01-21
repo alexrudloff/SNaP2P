@@ -20,6 +20,13 @@ const PROTOCOL_NAME = 'Noise_XX_25519_ChaChaPoly_SHA256';
 const EMPTY = new Uint8Array(0);
 
 /**
+ * Maximum nonce value before overflow.
+ * Per R5/L1: Defense-in-depth check to prevent nonce reuse.
+ * ChaCha20-Poly1305 uses a 64-bit nonce counter.
+ */
+const MAX_NONCE = BigInt(2) ** BigInt(64) - BigInt(1);
+
+/**
  * Cipher state for encrypting/decrypting after handshake
  */
 export interface NoiseCipherState {
@@ -338,6 +345,11 @@ export function noiseEncrypt(
   plaintext: Uint8Array,
   ad: Uint8Array = EMPTY
 ): Uint8Array {
+  // Per R5/L1: Check for nonce overflow (defense-in-depth)
+  if (state.nonce >= MAX_NONCE) {
+    throw new Error('Nonce overflow: session must be rekeyed or terminated');
+  }
+
   const nonce = nonceToBytes(state.nonce);
   state.nonce++;
 
@@ -353,6 +365,11 @@ export function noiseDecrypt(
   ciphertext: Uint8Array,
   ad: Uint8Array = EMPTY
 ): Uint8Array {
+  // Per R5/L1: Check for nonce overflow (defense-in-depth)
+  if (state.nonce >= MAX_NONCE) {
+    throw new Error('Nonce overflow: session must be rekeyed or terminated');
+  }
+
   const nonce = nonceToBytes(state.nonce);
   state.nonce++;
 

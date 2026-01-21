@@ -17,6 +17,14 @@ import { Session } from '../session/session.js';
 import { performInitiatorHandshake, performResponderHandshake, HandshakeConfig } from '../session/handshake.js';
 import { Multiplexer, MultiplexerConfig } from '../stream/multiplexer.js';
 import { SNaP2PStream } from '../stream/snap2p-stream.js';
+import { InviteTokenManager, InviteTokenConfig } from '../control/stealth.js';
+
+export interface RateLimitConfig {
+  /** Maximum connection attempts per IP within the window */
+  maxRequests: number;
+  /** Window size in milliseconds */
+  windowMs: number;
+}
 
 export interface PeerConfig {
   /**
@@ -36,6 +44,17 @@ export interface PeerConfig {
   handshakeTimeoutMs?: number;
   /** Maximum streams per session */
   maxStreamsPerSession?: number;
+  /**
+   * Rate limiting configuration for incoming connections.
+   * Per SPECS 4.1.3, Stealth mode MUST rate-limit unauthenticated handshakes.
+   * If not specified, defaults are applied based on visibility mode.
+   */
+  rateLimit?: RateLimitConfig | false;
+  /**
+   * Invite token configuration for Stealth mode.
+   * Per SPECS 4.2, invite tokens are shared out-of-band with locators.
+   */
+  inviteTokenConfig?: InviteTokenConfig;
 }
 
 export interface ConnectionInfo {
@@ -63,8 +82,9 @@ export class Peer extends EventEmitter<PeerEvents> {
   private attestation: NodeKeyAttestation | null = null;
   private listener: Listener | null = null;
   private connections: Map<string, ConnectionInfo> = new Map();
-  private config: Required<Omit<PeerConfig, 'wallet' | 'nodeKeys' | 'allowlist'>> & { allowlist?: Set<string> };
+  private config: Required<Omit<PeerConfig, 'wallet' | 'nodeKeys' | 'allowlist' | 'rateLimit' | 'inviteTokenConfig'>> & { allowlist?: Set<string>; rateLimit?: RateLimitConfig | false };
   private privateKey: string | null = null;
+  private inviteTokenManager: InviteTokenManager | null = null;
 
   private constructor(wallet: Wallet, nodeKeys: NodeKeyPair, config: PeerConfig) {
     super();
@@ -74,13 +94,33 @@ export class Peer extends EventEmitter<PeerEvents> {
     this.principal = wallet.principal;
     this.nodePublicKey = nodeKeys.publicKey;
 
+    // Determine default rate limit based on visibility mode per SPECS 4.1.3
+    let rateLimit: RateLimitConfig | false | undefined = config.rateLimit;
+    if (rateLimit === undefined) {
+      const visibility = config.visibility ?? VisibilityMode.PUBLIC;
+      if (visibility === VisibilityMode.STEALTH) {
+        // Strict rate limiting for Stealth mode per SPECS 4.1.3
+        rateLimit = { maxRequests: 5, windowMs: 60000 };
+      } else if (visibility === VisibilityMode.PRIVATE) {
+        // Moderate rate limiting for Private mode
+        rateLimit = { maxRequests: 30, windowMs: 60000 };
+      }
+      // Public mode: no rate limiting by default
+    }
+
     this.config = {
       visibility: config.visibility ?? VisibilityMode.PUBLIC,
       testnet: config.testnet ?? false,
       handshakeTimeoutMs: config.handshakeTimeoutMs ?? 30000,
       maxStreamsPerSession: config.maxStreamsPerSession ?? 100,
       allowlist: config.allowlist ? new Set(config.allowlist) : undefined,
+      rateLimit,
     };
+
+    // Initialize invite token manager for Stealth mode per SPECS 4.2
+    if (this.config.visibility === VisibilityMode.STEALTH) {
+      this.inviteTokenManager = new InviteTokenManager(config.inviteTokenConfig);
+    }
   }
 
   /**
@@ -141,7 +181,11 @@ export class Peer extends EventEmitter<PeerEvents> {
     }
 
     return new Promise((resolve, reject) => {
-      this.listener = listen({ port, host });
+      this.listener = listen({
+        port,
+        host,
+        rateLimiter: this.config.rateLimit ? this.config.rateLimit : undefined,
+      });
 
       this.listener.on('listening', (locator) => {
         this.emit('listening', locator);
@@ -177,8 +221,10 @@ export class Peer extends EventEmitter<PeerEvents> {
 
   /**
    * Dial a remote peer
+   * @param target The locator string (host:port) or Locator object
+   * @param options Optional dial options including invite token for Stealth nodes
    */
-  async dial(target: string | Locator): Promise<ConnectionInfo> {
+  async dial(target: string | Locator, options?: { inviteToken?: Uint8Array }): Promise<ConnectionInfo> {
     const locator = typeof target === 'string' ? parseLocator(target) : target;
 
     const socket = await dial(locator, { timeout: this.config.handshakeTimeoutMs });
@@ -188,6 +234,8 @@ export class Peer extends EventEmitter<PeerEvents> {
       timeoutMs: this.config.handshakeTimeoutMs,
       visibility: this.config.visibility,
       allowlist: this.config.allowlist,
+      testnet: this.config.testnet,
+      inviteToken: options?.inviteToken,
     };
 
     const result = await performInitiatorHandshake(
@@ -274,6 +322,13 @@ export class Peer extends EventEmitter<PeerEvents> {
     this.connections.clear();
 
     await this.stopListening();
+
+    // Clean up invite token manager
+    if (this.inviteTokenManager) {
+      this.inviteTokenManager.stop();
+      this.inviteTokenManager = null;
+    }
+
     this.emit('close');
   }
 
@@ -298,11 +353,54 @@ export class Peer extends EventEmitter<PeerEvents> {
     return this.connections.size;
   }
 
+  /**
+   * Generate an invite token for Stealth mode.
+   * Per SPECS 4.2: Invite tokens are shared out-of-band along with Locator.
+   * @throws Error if not in Stealth mode
+   */
+  generateInviteToken(options?: { expiryMs?: number; maxUses?: number; singleUse?: boolean }): Uint8Array {
+    if (!this.inviteTokenManager) {
+      throw new Error('Invite tokens are only available in Stealth mode');
+    }
+    return this.inviteTokenManager.generateToken(options);
+  }
+
+  /**
+   * Add an existing invite token.
+   * @throws Error if not in Stealth mode
+   */
+  addInviteToken(token: Uint8Array, options?: { expiryMs?: number; maxUses?: number; singleUse?: boolean }): void {
+    if (!this.inviteTokenManager) {
+      throw new Error('Invite tokens are only available in Stealth mode');
+    }
+    this.inviteTokenManager.addToken(token, options);
+  }
+
+  /**
+   * Revoke an invite token.
+   * @throws Error if not in Stealth mode
+   */
+  revokeInviteToken(token: Uint8Array): boolean {
+    if (!this.inviteTokenManager) {
+      throw new Error('Invite tokens are only available in Stealth mode');
+    }
+    return this.inviteTokenManager.revokeToken(token);
+  }
+
+  /**
+   * Get the number of active invite tokens.
+   */
+  getActiveInviteTokenCount(): number {
+    return this.inviteTokenManager?.getActiveTokenCount() ?? 0;
+  }
+
   private async handleIncomingConnection(socket: net.Socket, remote: Locator): Promise<void> {
     const handshakeConfig: HandshakeConfig = {
       timeoutMs: this.config.handshakeTimeoutMs,
       visibility: this.config.visibility,
       allowlist: this.config.allowlist,
+      testnet: this.config.testnet,
+      inviteTokenManager: this.inviteTokenManager ?? undefined,
     };
 
     const result = await performResponderHandshake(

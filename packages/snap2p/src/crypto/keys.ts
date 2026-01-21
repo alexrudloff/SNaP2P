@@ -5,8 +5,10 @@
 
 import { ed25519 } from '@noble/curves/ed25519';
 import { x25519 } from '@noble/curves/ed25519';
+import { edwardsToMontgomeryPub } from '@noble/curves/ed25519';
 import { sha512 } from '@noble/hashes/sha512';
 import { randomBytes } from '@noble/ciphers/webcrypto';
+import { bytesToHex, hexToBytes } from '../utils/hex.js';
 
 /**
  * A node keypair with both Ed25519 (signing) and X25519 (DH) components
@@ -95,9 +97,7 @@ export function getRandomBytes(length: number): Uint8Array {
  * Encode public key to hex string
  */
 export function publicKeyToHex(publicKey: Uint8Array): string {
-  return Array.from(publicKey)
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
+  return bytesToHex(publicKey);
 }
 
 /**
@@ -107,11 +107,7 @@ export function publicKeyFromHex(hex: string): Uint8Array {
   if (hex.length !== 64) {
     throw new Error('Invalid public key hex: expected 64 characters');
   }
-  const bytes = new Uint8Array(32);
-  for (let i = 0; i < 32; i++) {
-    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  }
-  return bytes;
+  return hexToBytes(hex);
 }
 
 /**
@@ -126,4 +122,19 @@ export function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
     result |= a[i] ^ b[i];
   }
   return result === 0;
+}
+
+/**
+ * Convert an Ed25519 public key to its corresponding X25519 public key.
+ * This is used to verify that an attestation's node public key (Ed25519)
+ * corresponds to the Noise handshake's static key (X25519).
+ *
+ * Per SPECS 2.4: "The secure channel handshake MUST be cryptographically
+ * bound to node_pubkey"
+ */
+export function ed25519PublicKeyToX25519(ed25519PublicKey: Uint8Array): Uint8Array {
+  if (ed25519PublicKey.length !== 32) {
+    throw new Error('Ed25519 public key must be 32 bytes');
+  }
+  return edwardsToMontgomeryPub(ed25519PublicKey);
 }

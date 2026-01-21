@@ -16,9 +16,11 @@ import {
   signMessageHashRsv,
   publicKeyToAddress,
   AddressVersion,
+  publicKeyFromSignatureRsv,
 } from '@stacks/transactions';
 import { sha256 } from '@noble/hashes/sha256';
 import { Principal, createPrincipal } from '../types/principal.js';
+import { bytesToHex, hexToBytes } from '../utils/hex.js';
 
 /**
  * Core wallet interface required by SNaP2P.
@@ -128,17 +130,31 @@ export function generateWallet(options: WalletOptions = {}): { wallet: Wallet; p
 }
 
 /**
- * Verify a wallet signature.
- * Note: Full verification requires the signer's public key.
+ * Verify a wallet signature using secp256k1 recovery.
+ * Recovers the public key from the signature and verifies it matches.
  */
 export function verifyWalletSignature(
-  publicKeyHex: string,
+  expectedPublicKeyHex: string,
   message: Uint8Array,
   signature: Uint8Array
 ): boolean {
-  // TODO: Implement proper secp256k1 signature verification
-  // For now, attestation-level verification is trusted
-  return signature.length > 0;
+  try {
+    // Hash the message (same as signing)
+    const messageHash = sha256(message);
+    const messageHashHex = Buffer.from(messageHash).toString('hex');
+
+    // Convert signature to hex format expected by Stacks library
+    const signatureHex = bytesToHex(signature);
+
+    // Recover the public key from the RSV signature
+    // publicKeyFromSignatureRsv expects (messageHash: string, signature: string)
+    const recoveredPublicKey = publicKeyFromSignatureRsv(messageHashHex, signatureHex);
+
+    // Compare recovered public key with expected (case-insensitive)
+    return recoveredPublicKey.toLowerCase() === expectedPublicKeyHex.toLowerCase();
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -152,16 +168,4 @@ export function addressFromPublicKey(publicKeyHex: string, options: WalletOption
   return publicKeyToAddress(addressVersion, publicKeyHex);
 }
 
-function hexToBytes(hex: string): Uint8Array {
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < bytes.length; i++) {
-    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  }
-  return bytes;
-}
-
-function bytesToHex(bytes: Uint8Array): string {
-  return Array.from(bytes)
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
-}
+// hexToBytes and bytesToHex are imported from '../utils/hex.js'

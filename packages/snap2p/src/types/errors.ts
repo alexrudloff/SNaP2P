@@ -3,6 +3,9 @@
  * Based on SPECS.md error handling requirements.
  */
 
+/**
+ * Error codes per SPECS 3.3
+ */
 export enum ErrorCode {
   /** No error */
   OK = 0,
@@ -10,22 +13,22 @@ export enum ErrorCode {
   /** Generic/unspecified error */
   ERR_UNKNOWN = 1,
 
-  /** Protocol version not supported */
+  /** Protocol version not supported (SPECS 3.3) */
   ERR_VERSION_UNSUPPORTED = 2,
 
   /** Authentication failed */
   ERR_AUTH_FAILED = 3,
 
-  /** Peer not on allowlist (Private/Stealth mode) */
+  /** Peer not on allowlist - ERR_NOT_ALLOWED (SPECS 3.3) */
   ERR_NOT_ALLOWED = 4,
 
-  /** Invalid invite token (Stealth mode) */
+  /** Invalid invite token - ERR_INVITE_INVALID (SPECS 3.3) */
   ERR_INVALID_TOKEN = 5,
 
-  /** Attestation verification failed */
+  /** Attestation verification failed - ERR_AUTH_INVALID (SPECS 3.3) */
   ERR_ATTESTATION_INVALID = 6,
 
-  /** Attestation expired */
+  /** Attestation expired - ERR_AUTH_EXPIRED (SPECS 3.3) */
   ERR_ATTESTATION_EXPIRED = 7,
 
   /** Handshake failed */
@@ -57,6 +60,15 @@ export enum ErrorCode {
 
   /** Internal error */
   ERR_INTERNAL = 17,
+
+  /** Invite token required for stealth mode - ERR_INVITE_REQUIRED (SPECS 3.3) */
+  ERR_INVITE_REQUIRED = 18,
+
+  /** Rate limited - ERR_RATE_LIMITED (SPECS 3.3) */
+  ERR_RATE_LIMITED = 19,
+
+  /** Stream refused - ERR_STREAM_REFUSED (SPECS 3.3) */
+  ERR_STREAM_REFUSED = 20,
 }
 
 /**
@@ -82,6 +94,9 @@ export function getErrorMessage(code: ErrorCode): string {
     [ErrorCode.ERR_INVALID_MESSAGE]: 'Invalid message format',
     [ErrorCode.ERR_RESOURCE_EXHAUSTED]: 'Resource exhausted',
     [ErrorCode.ERR_INTERNAL]: 'Internal error',
+    [ErrorCode.ERR_INVITE_REQUIRED]: 'Invite token required',
+    [ErrorCode.ERR_RATE_LIMITED]: 'Rate limited',
+    [ErrorCode.ERR_STREAM_REFUSED]: 'Stream refused',
   };
   return messages[code] ?? 'Unknown error';
 }

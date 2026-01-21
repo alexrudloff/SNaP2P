@@ -13,6 +13,7 @@ export {
   publicKeyToHex,
   publicKeyFromHex,
   constantTimeEqual,
+  ed25519PublicKeyToX25519,
 } from './keys.js';
 
 export type { NoiseState, NoiseCipherState } from './noise.js';

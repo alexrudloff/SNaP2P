@@ -11,7 +11,7 @@
 
 import * as net from 'node:net';
 import { NoiseHandshake, NoiseState, noiseEncrypt, noiseDecrypt, createInitiatorHandshake, createResponderHandshake } from '../crypto/noise.js';
-import { NodeKeyPair } from '../crypto/keys.js';
+import { NodeKeyPair, ed25519PublicKeyToX25519, constantTimeEqual, getRandomBytes } from '../crypto/keys.js';
 import { FrameBuffer, frameMessage } from '../wire/framing.js';
 import { encodeMessage, decodeMessage } from '../wire/codec.js';
 import {
@@ -37,7 +37,15 @@ import {
   serializeAttestation,
   deserializeAttestation,
   verifyAttestation,
+  verifyAttestationSignature,
 } from '../identity/attestation.js';
+import {
+  InviteTokenManager,
+  createKnockMessage,
+  createKnockResponseMessage,
+  createInviteFailMessage,
+  createInviteRequiredMessage,
+} from '../control/stealth.js';
 
 export interface HandshakeConfig {
   /** Timeout for handshake completion in ms */
@@ -46,6 +54,12 @@ export interface HandshakeConfig {
   visibility?: VisibilityMode;
   /** Optional allowlist of principals (for Private/Stealth) */
   allowlist?: Set<string>;
+  /** Use testnet addresses for verification */
+  testnet?: boolean;
+  /** Invite token for Stealth mode (client-side) */
+  inviteToken?: Uint8Array;
+  /** Invite token manager for Stealth mode (server-side) */
+  inviteTokenManager?: InviteTokenManager;
 }
 
 export interface HandshakeResult {
@@ -60,6 +74,40 @@ export interface HandshakeResult {
 }
 
 const DEFAULT_TIMEOUT = 30000;
+
+/**
+ * Verify that the Noise handshake's remote static key (X25519) corresponds to
+ * the Ed25519 node public key in the attestation.
+ *
+ * Per SPECS 2.4: "The secure channel handshake MUST be cryptographically bound to node_pubkey"
+ *
+ * This prevents an attacker from presenting a valid attestation for a different
+ * node key than the one used in the Noise handshake.
+ */
+function verifyNodeKeyBinding(
+  noiseRemoteStaticKey: Uint8Array,
+  attestationNodePublicKey: Uint8Array
+): { valid: boolean; error?: string } {
+  try {
+    // Convert Ed25519 public key to X25519 public key
+    const expectedX25519Key = ed25519PublicKeyToX25519(attestationNodePublicKey);
+
+    // Use constant-time comparison to prevent timing attacks
+    if (!constantTimeEqual(noiseRemoteStaticKey, expectedX25519Key)) {
+      return {
+        valid: false,
+        error: 'Node key binding failed: Noise static key does not match attestation node public key',
+      };
+    }
+
+    return { valid: true };
+  } catch (err) {
+    return {
+      valid: false,
+      error: `Node key binding verification failed: ${err instanceof Error ? err.message : 'unknown error'}`,
+    };
+  }
+}
 
 /**
  * Read a complete frame from socket
@@ -182,6 +230,7 @@ async function readEncrypted(
 
 /**
  * Perform handshake as initiator (client)
+ * Per SPECS 4.3: If connecting to a Stealth node, must send KNOCK first.
  */
 export async function performInitiatorHandshake(
   socket: net.Socket,
@@ -192,6 +241,32 @@ export async function performInitiatorHandshake(
   const timeout = config.timeoutMs ?? DEFAULT_TIMEOUT;
   const visibility = config.visibility ?? VisibilityMode.PUBLIC;
   const frameBuffer = new FrameBuffer();
+
+  // Step 0 (Stealth only): Send KNOCK if we have an invite token
+  // Per SPECS 4.3 Step 1: Client sends KNOCK immediately after TCP connect
+  if (config.inviteToken) {
+    const knock = createKnockMessage(config.inviteToken);
+    const knockBytes = encodeMessage(knock);
+    sendFrame(socket, knockBytes);
+
+    // Wait for KNOCK_RESPONSE or AUTH_FAIL
+    const responseFrame = await readFrame(socket, frameBuffer, timeout);
+    const response = decodeMessage(responseFrame);
+
+    if (response.type === MessageType.AUTH_FAIL) {
+      const fail = response as AuthFailMessage;
+      throw new SNaP2PError(fail.errorCode, fail.reason ?? 'Knock rejected');
+    }
+
+    if (response.type !== MessageType.KNOCK_RESPONSE) {
+      throw new SNaP2PError(ErrorCode.ERR_INVALID_MESSAGE, 'Expected KNOCK_RESPONSE');
+    }
+
+    const knockResponse = response as import('../types/messages.js').KnockResponseMessage;
+    if (!knockResponse.allowed) {
+      throw new SNaP2PError(ErrorCode.ERR_INVALID_TOKEN, 'Knock not allowed');
+    }
+  }
 
   // Step 1: Noise XX handshake
   const noise = createInitiatorHandshake(nodeKeys.x25519PrivateKey, nodeKeys.x25519PublicKey);
@@ -222,9 +297,17 @@ export async function performInitiatorHandshake(
     throw new SNaP2PError(ErrorCode.ERR_INVALID_MESSAGE, 'Expected AUTH');
   }
   const remoteAttestation = deserializeAttestation((remoteAuth as AuthMessage).attestation);
-  const verifyResult = verifyAttestation(remoteAttestation);
+  // Full cryptographic signature verification per SPECS 2.3.1
+  const verifyResult = verifyAttestationSignature(remoteAttestation, { testnet: config.testnet });
   if (!verifyResult.valid) {
     throw new SNaP2PError(ErrorCode.ERR_ATTESTATION_INVALID, verifyResult.error);
+  }
+
+  // Verify node key binding per SPECS 2.4
+  // Ensure the Noise static key matches the attestation's node public key
+  const bindingResult = verifyNodeKeyBinding(noiseState.remoteStaticKey, remoteAttestation.nodePublicKey);
+  if (!bindingResult.valid) {
+    throw new SNaP2PError(ErrorCode.ERR_ATTESTATION_INVALID, bindingResult.error);
   }
 
   // Step 6: Receive AUTH_OK or AUTH_FAIL
@@ -252,6 +335,7 @@ export async function performInitiatorHandshake(
 
 /**
  * Perform handshake as responder (server)
+ * Per SPECS 4.3: Stealth mode requires KNOCK before proceeding.
  */
 export async function performResponderHandshake(
   socket: net.Socket,
@@ -263,6 +347,42 @@ export async function performResponderHandshake(
   const visibility = config.visibility ?? VisibilityMode.PUBLIC;
   const allowlist = config.allowlist;
   const frameBuffer = new FrameBuffer();
+
+  // Step 0 (Stealth only): Handle KNOCK if in Stealth mode
+  // Per SPECS 4.3: Stealth nodes require KNOCK before expensive auth/crypto
+  if (visibility === VisibilityMode.STEALTH) {
+    if (!config.inviteTokenManager) {
+      // Stealth mode requires an invite token manager
+      const fail = createInviteRequiredMessage();
+      sendFrame(socket, encodeMessage(fail));
+      throw new SNaP2PError(ErrorCode.ERR_INTERNAL, 'Stealth mode requires invite token manager');
+    }
+
+    // Wait for KNOCK message
+    const knockFrame = await readFrame(socket, frameBuffer, timeout);
+    const knockMsg = decodeMessage(knockFrame);
+
+    if (knockMsg.type !== MessageType.KNOCK) {
+      // Per SPECS 4.3: If invite token is missing, respond AUTH_FAIL
+      const fail = createInviteRequiredMessage();
+      sendFrame(socket, encodeMessage(fail));
+      throw new SNaP2PError(ErrorCode.ERR_INVITE_REQUIRED, 'KNOCK required for Stealth mode');
+    }
+
+    const knock = knockMsg as import('../types/messages.js').KnockMessage;
+
+    // Validate invite token
+    if (!config.inviteTokenManager.validateToken(knock.inviteToken)) {
+      // Per SPECS 4.3: Invalid token -> AUTH_FAIL{ERR_INVITE_INVALID}
+      const fail = createInviteFailMessage();
+      sendFrame(socket, encodeMessage(fail));
+      throw new SNaP2PError(ErrorCode.ERR_INVALID_TOKEN, 'Invalid invite token');
+    }
+
+    // Token valid - send KNOCK_RESPONSE{allowed: true}
+    const response = createKnockResponseMessage(true);
+    sendFrame(socket, encodeMessage(response));
+  }
 
   // Step 1: Noise XX handshake
   const noise = createResponderHandshake(nodeKeys.x25519PrivateKey, nodeKeys.x25519PublicKey);
@@ -288,12 +408,22 @@ export async function performResponderHandshake(
     throw new SNaP2PError(ErrorCode.ERR_INVALID_MESSAGE, 'Expected AUTH');
   }
   const remoteAttestation = deserializeAttestation((remoteAuth as AuthMessage).attestation);
-  const verifyResult = verifyAttestation(remoteAttestation);
+  // Full cryptographic signature verification per SPECS 2.3.1
+  const verifyResult = verifyAttestationSignature(remoteAttestation, { testnet: config.testnet });
 
   if (!verifyResult.valid) {
     const authFail = createAuthFailMessage(ErrorCode.ERR_ATTESTATION_INVALID, verifyResult.error);
     sendEncrypted(socket, noiseState, authFail);
     throw new SNaP2PError(ErrorCode.ERR_ATTESTATION_INVALID, verifyResult.error);
+  }
+
+  // Verify node key binding per SPECS 2.4
+  // Ensure the Noise static key matches the attestation's node public key
+  const bindingResult = verifyNodeKeyBinding(noiseState.remoteStaticKey, remoteAttestation.nodePublicKey);
+  if (!bindingResult.valid) {
+    const authFail = createAuthFailMessage(ErrorCode.ERR_ATTESTATION_INVALID, bindingResult.error);
+    sendEncrypted(socket, noiseState, authFail);
+    throw new SNaP2PError(ErrorCode.ERR_ATTESTATION_INVALID, bindingResult.error);
   }
 
   // Check allowlist
@@ -310,8 +440,8 @@ export async function performResponderHandshake(
   sendEncrypted(socket, noiseState, auth);
 
   // Step 6: Send AUTH_OK
-  const sessionId = new Uint8Array(32);
-  crypto.getRandomValues(sessionId);
+  // Use consistent random source per R4 (getRandomBytes from @noble/ciphers)
+  const sessionId = getRandomBytes(32);
   const authOk = createAuthOkMessage(formatPrincipal(attestation.principal), sessionId);
   sendEncrypted(socket, noiseState, authOk);
 

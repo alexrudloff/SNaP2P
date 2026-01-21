@@ -20,6 +20,7 @@ export {
   serializeAttestation,
   deserializeAttestation,
   verifyAttestation,
+  verifyAttestationSignature,
   getAttestationPayloadBytes,
   isAttestationExpiringSoon,
 } from './attestation.js';

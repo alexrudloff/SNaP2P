@@ -21,7 +21,7 @@ import {
   KnockResponseMessage,
   ErrorMessage,
 } from '../types/messages.js';
-import { ErrorCode } from '../types/errors.js';
+import { ErrorCode, SNaP2PError } from '../types/errors.js';
 
 /**
  * Encode options for deterministic CBOR
@@ -88,6 +88,7 @@ function messageToWire(message: Message): WireMessage {
         n: message.nonce,
         ts: message.timestamp,
         vis: message.visibility,
+        cap: message.capabilities,
       };
 
     case MessageType.AUTH:
@@ -183,6 +184,7 @@ function wireToMessage(wire: WireMessage): Message {
         nonce: wire.n as Uint8Array,
         timestamp: BigInt(wire.ts as number | bigint),
         visibility: wire.vis as VisibilityMode,
+        capabilities: (wire.cap as string[]) ?? [],
       } satisfies HelloMessage;
 
     case MessageType.AUTH:
@@ -262,6 +264,7 @@ function wireToMessage(wire: WireMessage): Message {
       } satisfies ErrorMessage;
 
     default:
-      throw new Error(`Unknown message type: ${type}`);
+      // Per SPECS 3.0: Unknown message types MUST cause ERR_VERSION_UNSUPPORTED
+      throw new SNaP2PError(ErrorCode.ERR_VERSION_UNSUPPORTED, `Unknown message type: ${type}`);
   }
 }

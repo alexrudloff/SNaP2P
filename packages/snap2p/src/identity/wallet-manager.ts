@@ -26,6 +26,9 @@ import {
 import { sha256 } from '@noble/hashes/sha256';
 import { Principal, createPrincipal } from '../types/principal.js';
 import { Wallet } from './wallet.js';
+import { hexToBytes } from '../utils/hex.js';
+import { secureZeroString } from '../utils/secure.js';
+import { SecureSessionStorage, createSecureSessionStorage } from '../utils/memory-encryption.js';
 
 /** Wallet file format version */
 const WALLET_FILE_VERSION = 1;
@@ -33,8 +36,8 @@ const WALLET_FILE_VERSION = 1;
 /** Default directory for wallet storage */
 const DEFAULT_WALLET_DIR = path.join(os.homedir(), '.snap2p', 'wallets');
 
-/** Scrypt parameters */
-const SCRYPT_N = 16384;
+/** Scrypt parameters - N=2^17 for strong brute-force resistance */
+const SCRYPT_N = 131072; // 2^17 - recommended for high-security applications
 const SCRYPT_R = 8;
 const SCRYPT_P = 1;
 const SCRYPT_KEYLEN = 32;
@@ -89,15 +92,20 @@ export interface WalletManagerOptions {
 
 /**
  * Manages wallet storage, encryption, and signing
+ *
+ * R9 Enhancement: Uses SecureSessionStorage with non-extractable CryptoKey
+ * to minimize plaintext exposure from hours to milliseconds.
  */
 export class WalletManager {
   private walletDir: string;
   private testnet: boolean;
   private registry: WalletRegistry | null = null;
+
+  // R9: Secure storage for sensitive data using non-extractable CryptoKey
+  private secureStorage: SecureSessionStorage | null = null;
   private unlockedWallet: {
     accountId: string;
-    seedPhrase: string;
-    privateKey: string;
+    address: string;
     wallet: Wallet;
   } | null = null;
 
@@ -110,7 +118,8 @@ export class WalletManager {
    * Initialize the wallet manager (creates directories if needed)
    */
   async initialize(): Promise<void> {
-    await fs.promises.mkdir(this.walletDir, { recursive: true });
+    // Create wallet directory with secure permissions (owner only)
+    await fs.promises.mkdir(this.walletDir, { recursive: true, mode: 0o700 });
     await this.loadRegistry();
   }
 
@@ -160,8 +169,9 @@ export class WalletManager {
     password: string,
     displayName: string
   ): Promise<WalletAccount> {
-    if (password.length < 8) {
-      throw new Error('Password must be at least 8 characters');
+    // Per R3/L2: Increase minimum password length for stronger brute-force resistance
+    if (password.length < 12) {
+      throw new Error('Password must be at least 12 characters');
     }
 
     // Derive address from seed
@@ -209,9 +219,9 @@ export class WalletManager {
       },
     };
 
-    // Save wallet file
+    // Save wallet file with secure permissions (owner read/write only)
     const walletPath = path.join(this.walletDir, `${accountId}.wallet.json`);
-    await fs.promises.writeFile(walletPath, JSON.stringify(walletFile, null, 2));
+    await fs.promises.writeFile(walletPath, JSON.stringify(walletFile, null, 2), { mode: 0o600 });
 
     // Update registry
     const now = new Date().toISOString();
@@ -238,6 +248,11 @@ export class WalletManager {
 
   /**
    * Unlock a wallet with password
+   *
+   * R9 Enhancement: Uses SecureSessionStorage to minimize plaintext exposure.
+   * - Seed phrase is encrypted in memory using a non-extractable CryptoKey
+   * - The session key lives in C++ memory, not the JavaScript heap
+   * - Plaintext is only exposed during sign operations (~1-10ms)
    */
   async unlock(accountId: string, password: string): Promise<Wallet> {
     const walletPath = path.join(this.walletDir, `${accountId}.wallet.json`);
@@ -250,7 +265,7 @@ export class WalletManager {
       throw new Error('Wallet not found');
     }
 
-    // Decrypt seed phrase
+    // Decrypt seed phrase from disk
     const salt = Buffer.from(walletFile.crypto.salt, 'base64');
     const iv = Buffer.from(walletFile.crypto.iv, 'base64');
     const tag = Buffer.from(walletFile.crypto.tag, 'base64');
@@ -265,44 +280,60 @@ export class WalletManager {
     const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
     decipher.setAuthTag(tag);
 
-    let seedPhrase: string;
+    let seedPhraseBuffer: Buffer;
     try {
-      seedPhrase = Buffer.concat([
+      seedPhraseBuffer = Buffer.concat([
         decipher.update(ciphertext),
         decipher.final(),
-      ]).toString('utf8');
+      ]);
     } catch {
       throw new Error('Invalid password');
     }
 
-    // Derive private key from seed
-    const stacksWallet = await generateStacksWallet({
-      secretKey: seedPhrase,
-      password: seedPhrase,
-    });
-    const privateKey = stacksWallet.accounts[0].stxPrivateKey;
+    // R9: Store seed phrase securely with non-extractable session key
+    // This reduces plaintext exposure from hours to milliseconds
+    this.secureStorage = createSecureSessionStorage();
+    await this.secureStorage.store(new Uint8Array(seedPhraseBuffer));
 
-    // Create wallet interface
+    // Zero the plaintext buffer immediately
+    seedPhraseBuffer.fill(0);
+
+    // Create wallet interface with secure signing
     const principal = createPrincipal(walletFile.address);
+    const testnet = this.testnet;
+    const secureStorage = this.secureStorage;
+
     const wallet: Wallet = {
       principal,
       address: walletFile.address,
       getAddress: () => walletFile.address,
       sign: async (message: Uint8Array): Promise<Uint8Array> => {
-        const messageHash = sha256(message);
-        const signature = signMessageHashRsv({
-          privateKey,
-          messageHash: Buffer.from(messageHash).toString('hex'),
+        // R9: Retrieve seed only during sign operation (~1-10ms exposure)
+        return await secureStorage.withDecryptedString(async (seedPhrase) => {
+          // Derive private key from seed (this creates temporary strings)
+          const stacksWallet = await generateStacksWallet({
+            secretKey: seedPhrase,
+            password: seedPhrase,
+          });
+          const privateKey = stacksWallet.accounts[0].stxPrivateKey;
+
+          // Sign the message
+          const messageHash = sha256(message);
+          const signature = signMessageHashRsv({
+            privateKey,
+            messageHash: Buffer.from(messageHash).toString('hex'),
+          });
+
+          // Return signature - privateKey goes out of scope and eligible for GC
+          return hexToBytes(signature);
         });
-        return hexToBytes(signature);
       },
     };
 
-    // Update state
+    // Update state (no longer stores sensitive data directly)
     this.unlockedWallet = {
       accountId,
-      seedPhrase,
-      privateKey,
+      address: walletFile.address,
       wallet,
     };
 
@@ -320,9 +351,18 @@ export class WalletManager {
   }
 
   /**
-   * Lock the current wallet
+   * Lock the current wallet and securely clear sensitive data from memory
+   *
+   * R9 Enhancement: Clearing the SecureSessionStorage releases the non-extractable
+   * CryptoKey from C++ memory immediately. The encrypted data becomes useless
+   * without the key, providing immediate security instead of waiting for GC.
    */
   lock(): void {
+    // R9: Clear the secure storage - releases CryptoKey from C++ memory
+    if (this.secureStorage) {
+      this.secureStorage.clear();
+      this.secureStorage = null;
+    }
     this.unlockedWallet = null;
   }
 
@@ -355,12 +395,16 @@ export class WalletManager {
 
   /**
    * Export the seed phrase (requires unlocked wallet)
+   *
+   * R9 Enhancement: The seed phrase is retrieved from secure storage,
+   * decrypted only for this operation. The returned string should be
+   * used immediately and references discarded.
    */
-  exportSeedPhrase(): string {
-    if (!this.unlockedWallet) {
+  async exportSeedPhrase(): Promise<string> {
+    if (!this.unlockedWallet || !this.secureStorage) {
       throw new Error('Wallet is locked');
     }
-    return this.unlockedWallet.seedPhrase;
+    return this.secureStorage.retrieveString();
   }
 
   private async loadRegistry(): Promise<void> {
@@ -375,14 +419,9 @@ export class WalletManager {
 
   private async saveRegistry(): Promise<void> {
     const registryPath = path.join(this.walletDir, 'registry.json');
-    await fs.promises.writeFile(registryPath, JSON.stringify(this.registry, null, 2));
+    // Secure permissions - registry contains wallet metadata
+    await fs.promises.writeFile(registryPath, JSON.stringify(this.registry, null, 2), { mode: 0o600 });
   }
 }
 
-function hexToBytes(hex: string): Uint8Array {
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < bytes.length; i++) {
-    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  }
-  return bytes;
-}
+// hexToBytes is imported from '../utils/hex.js'

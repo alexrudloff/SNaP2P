@@ -27,3 +27,6 @@ coverage/
 
 # pnpm
 .pnpm-store/
+
+# Audit reports
+audit.md

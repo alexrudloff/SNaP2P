@@ -40,7 +40,20 @@ export interface BaseMessage {
 }
 
 /**
+ * Capability flags for HELLO message per SPECS 3.2.1
+ */
+export enum Capability {
+  /** Supports stealth mode */
+  STEALTH = 'stealth',
+  /** Supports aliases module */
+  ALIASES = 'aliases',
+  /** Supports PX-1 discovery */
+  PX1 = 'px1',
+}
+
+/**
  * HELLO message - initial handshake message
+ * Per SPECS 3.2.1
  */
 export interface HelloMessage extends BaseMessage {
   readonly type: MessageType.HELLO;
@@ -49,6 +62,8 @@ export interface HelloMessage extends BaseMessage {
   readonly nonce: Uint8Array;
   readonly timestamp: bigint;
   readonly visibility: VisibilityMode;
+  /** Framework feature flags per SPECS 3.2.1 */
+  readonly capabilities: string[];
 }
 
 /**
